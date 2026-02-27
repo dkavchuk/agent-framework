@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Agents.AI.Hosting.AGUI.AspNetCore.Shared;
@@ -65,12 +66,31 @@ public static class AGUIEndpointRouteBuilderExtensions
                 }
             };
 
+            // Resolve session store from DI (opt-in via registration)
+            var sessionStore = context.RequestServices.GetService<AgentSessionStore>();
+            AgentSession? session = null;
+
+            if (sessionStore is not null && !string.IsNullOrWhiteSpace(input.ThreadId))
+            {
+                session = await sessionStore.GetSessionAsync(aiAgent, input.ThreadId, cancellationToken).ConfigureAwait(false);
+            }
+
             // Run the agent and convert to AG-UI events
-            var events = aiAgent.RunStreamingAsync(
+            var agentStream = aiAgent.RunStreamingAsync(
                 messages,
+                session: session,
                 options: runOptions,
                 cancellationToken: cancellationToken)
-                .AsChatResponseUpdatesAsync()
+                .AsChatResponseUpdatesAsync();
+
+            // If a session was resolved, wrap the stream to persist state after consumption
+            if (session is not null && sessionStore is not null)
+            {
+                agentStream = WithCompletionCallbackAsync(agentStream, async () =>
+                await sessionStore.SaveSessionAsync(aiAgent, input.ThreadId!, session, cancellationToken).ConfigureAwait(false), cancellationToken);
+            }
+
+            var events = agentStream
                 .FilterServerToolsFromMixedToolInvocationsAsync(clientTools, cancellationToken)
                 .AsAGUIEventStreamAsync(
                     input.ThreadId,
@@ -126,12 +146,31 @@ public static class AGUIEndpointRouteBuilderExtensions
             };
 
             var aiAgent = await agentFactory(pattern, context, runOptions, cancellationToken).ConfigureAwait(true);
+            // Resolve session store from DI (opt-in via registration)
+            var sessionStore = context.RequestServices.GetService<AgentSessionStore>();
+            AgentSession? session = null;
+
+            if (sessionStore is not null && !string.IsNullOrWhiteSpace(input.ThreadId))
+            {
+                session = await sessionStore.GetSessionAsync(aiAgent, input.ThreadId, cancellationToken).ConfigureAwait(false);
+            }
+
             // Run the agent and convert to AG-UI events
-            var events = aiAgent.RunStreamingAsync(
+            var agentStream = aiAgent.RunStreamingAsync(
                 messages,
+                session: session,
                 options: runOptions,
                 cancellationToken: cancellationToken)
-                .AsChatResponseUpdatesAsync()
+                .AsChatResponseUpdatesAsync();
+
+            // If a session was resolved, wrap the stream to persist state after consumption
+            if (session is not null && sessionStore is not null)
+            {
+                agentStream = WithCompletionCallbackAsync(agentStream, async () =>
+                await sessionStore.SaveSessionAsync(aiAgent, input.ThreadId!, session, cancellationToken).ConfigureAwait(false), cancellationToken);
+            }
+
+            var events = agentStream
                 .FilterServerToolsFromMixedToolInvocationsAsync(clientTools, cancellationToken)
                 .AsAGUIEventStreamAsync(
                     input.ThreadId,
@@ -142,5 +181,21 @@ public static class AGUIEndpointRouteBuilderExtensions
             var sseLogger = context.RequestServices.GetRequiredService<ILogger<AGUIServerSentEventsResult>>();
             return new AGUIServerSentEventsResult(events, sseLogger);
         });
+    }
+
+    /// <summary>
+    /// Wraps an <see cref="IAsyncEnumerable{T}"/> so that a callback is invoked after the source is fully consumed.
+    /// </summary>
+    private static async IAsyncEnumerable<T> WithCompletionCallbackAsync<T>(
+        IAsyncEnumerable<T> source,
+        Func<Task> onCompleted,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await foreach (var item in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            yield return item;
+        }
+
+        await onCompleted().ConfigureAwait(false);
     }
 }
