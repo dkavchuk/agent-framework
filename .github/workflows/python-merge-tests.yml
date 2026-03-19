@@ -100,9 +100,8 @@ jobs:
           os: ${{ runner.os }}
       - name: Test with pytest (unit tests only)
         run: >
-          uv run poe all-tests
+          uv run poe test -A
           -m "not integration"
-          -n logical --dist worksteal
           --timeout=120 --session-timeout=900 --timeout_method thread
           --retries 2 --retry-delay 5
         working-directory: ./python
@@ -288,7 +287,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: integration
     env:
-      UV_PYTHON: "3.10"
+      UV_PYTHON: "3.11"
       OPENAI_CHAT_MODEL_ID: ${{ vars.OPENAI__CHATMODELID }}
       OPENAI_RESPONSES_MODEL_ID: ${{ vars.OPENAI__RESPONSESMODELID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI__APIKEY }}
