@@ -8,7 +8,6 @@ import json
 import logging
 import sys
 import typing
-import warnings
 from collections.abc import (
     AsyncIterable,
     Awaitable,
@@ -63,7 +62,12 @@ if TYPE_CHECKING:
     from ._clients import SupportsChatGetResponse
     from ._compaction import CompactionStrategy, TokenizerProtocol
     from ._mcp import MCPTool
-    from ._middleware import FunctionInvocationContext, FunctionMiddlewarePipeline, FunctionMiddlewareTypes
+    from ._middleware import (
+        ChatAndFunctionMiddlewareTypes,
+        FunctionInvocationContext,
+        FunctionMiddlewarePipeline,
+        FunctionMiddlewareTypes,
+    )
     from ._sessions import AgentSession
     from ._types import (
         ChatOptions,
@@ -339,8 +343,6 @@ class FunctionTool(SerializationMixin):
         self._instance = None  # Store the instance for bound methods
         self._context_parameter_name: str | None = None
         self._input_model_explicitly_provided = input_model is not None
-        # TODO(Copilot): Delete once legacy ``**kwargs`` runtime injection is removed.
-        self._forward_runtime_kwargs: bool = False
         if self.func:
             self._discover_injected_parameters()
 
@@ -385,10 +387,6 @@ class FunctionTool(SerializationMixin):
         for name, param in signature.parameters.items():
             if name in {"self", "cls"}:
                 continue
-            if param.kind == inspect.Parameter.VAR_KEYWORD:
-                self._forward_runtime_kwargs = True
-                continue
-
             annotation = type_hints.get(name, param.annotation)
             if self._is_context_parameter(name, annotation):
                 if self._context_parameter_name is not None:
@@ -461,9 +459,15 @@ class FunctionTool(SerializationMixin):
         if func is None:
             return create_model(f"{self.name}_input")
         sig = inspect.signature(func)
+        try:
+            type_hints = typing.get_type_hints(func, include_extras=True)
+        except Exception:
+            type_hints = {}
         fields: dict[str, Any] = {
             pname: (
-                _parse_annotation(param.annotation) if param.annotation is not inspect.Parameter.empty else str,
+                _parse_annotation(type_hints.get(pname, param.annotation))
+                if type_hints.get(pname, param.annotation) is not inspect.Parameter.empty
+                else str,
                 param.default if param.default is not inspect.Parameter.empty else ...,
             )
             for pname, param in sig.parameters.items()
@@ -507,6 +511,7 @@ class FunctionTool(SerializationMixin):
         *,
         arguments: BaseModel | Mapping[str, Any] | None = None,
         context: FunctionInvocationContext | None = None,
+        tool_call_id: str | None = None,
         **kwargs: Any,
     ) -> list[Content]:
         """Run the AI function with the provided arguments as a Pydantic model.
@@ -519,7 +524,10 @@ class FunctionTool(SerializationMixin):
         Keyword Args:
             arguments: A mapping or model instance containing the arguments for the function.
             context: Explicit function invocation context carrying runtime kwargs.
-            kwargs: Deprecated keyword arguments to pass to the function. Use ``context`` instead.
+            tool_call_id: Optional tool call identifier used for telemetry and tracing.
+            kwargs: Direct function argument values. When provided, every keyword
+                must match a declared tool parameter. Runtime data must be passed
+                via ``context``.
 
         Returns:
             A list of Content items representing the tool output.
@@ -541,18 +549,13 @@ class FunctionTool(SerializationMixin):
             {key: value for key, value in kwargs.items() if key in parameter_names} if arguments is None else {}
         )
         runtime_kwargs = dict(context.kwargs) if context is not None else {}
-        deprecated_runtime_kwargs = {
-            key: value for key, value in kwargs.items() if key not in direct_argument_kwargs and key != "tool_call_id"
-        }
-        if deprecated_runtime_kwargs:
-            warnings.warn(
-                "Passing runtime keyword arguments directly to FunctionTool.invoke() is deprecated; "
-                "pass them via FunctionInvocationContext instead.",
-                DeprecationWarning,
-                stacklevel=2,
+        unexpected_kwargs = {key: value for key, value in kwargs.items() if key not in direct_argument_kwargs}
+        if unexpected_kwargs:
+            unexpected_names = ", ".join(sorted(unexpected_kwargs))
+            raise TypeError(
+                f"Unexpected keyword argument(s) for tool '{self.name}': {unexpected_names}. "
+                "Pass runtime data via FunctionInvocationContext instead."
             )
-        runtime_kwargs.update(deprecated_runtime_kwargs)
-        tool_call_id = kwargs.get("tool_call_id", runtime_kwargs.pop("tool_call_id", None))
         if arguments is None and direct_argument_kwargs:
             arguments = direct_argument_kwargs
         if arguments is None and context is not None:
@@ -603,17 +606,6 @@ class FunctionTool(SerializationMixin):
 
         call_kwargs = dict(validated_arguments)
         observable_kwargs = dict(validated_arguments)
-
-        # Legacy runtime kwargs injection path retained for backwards compatibility with tools
-        # that still declare ``**kwargs``. New tools should consume runtime data via ``ctx``.
-        legacy_runtime_kwargs = dict(runtime_kwargs)
-        if self._forward_runtime_kwargs and legacy_runtime_kwargs:
-            for key, value in legacy_runtime_kwargs.items():
-                if key not in call_kwargs:
-                    call_kwargs[key] = value
-                if key not in observable_kwargs:
-                    observable_kwargs[key] = value
-
         if self._context_parameter_name is not None and effective_context is not None:
             call_kwargs[self._context_parameter_name] = effective_context
 
@@ -1409,7 +1401,7 @@ async def _auto_invoke_function(
         # No middleware - execute directly
         try:
             direct_context = None
-            if getattr(tool, "_forward_runtime_kwargs", False) or getattr(tool, "_context_parameter_name", None):
+            if getattr(tool, "_context_parameter_name", None):
                 direct_context = FunctionInvocationContext(
                     function=tool,
                     arguments=args,
@@ -2024,17 +2016,36 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
     def __init__(
         self,
         *,
-        function_middleware: Sequence[FunctionMiddlewareTypes] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         function_invocation_configuration: FunctionInvocationConfiguration | None = None,
         **kwargs: Any,
     ) -> None:
-        self.function_middleware: list[FunctionMiddlewareTypes] = (
-            list(function_middleware) if function_middleware else []
-        )
+        from ._middleware import categorize_middleware
+
+        middleware_list = categorize_middleware(middleware)
+        self.function_middleware: list[FunctionMiddlewareTypes] = list(middleware_list["function"])
+        self._cached_function_middleware_pipeline: FunctionMiddlewarePipeline | None = None
         self.function_invocation_configuration = normalize_function_invocation_configuration(
             function_invocation_configuration
         )
+        if (chat_middleware := (middleware_list["chat"] or None)) is not None:
+            kwargs["middleware"] = chat_middleware
         super().__init__(**kwargs)
+
+    def _get_function_middleware_pipeline(
+        self,
+        middleware: Sequence[FunctionMiddlewareTypes],
+    ) -> FunctionMiddlewarePipeline:
+        from ._middleware import FunctionMiddlewarePipeline
+
+        effective_middleware = [*self.function_middleware, *middleware]
+        if self._cached_function_middleware_pipeline is not None and self._cached_function_middleware_pipeline.matches(
+            effective_middleware
+        ):
+            return self._cached_function_middleware_pipeline
+
+        self._cached_function_middleware_pipeline = FunctionMiddlewarePipeline(*effective_middleware)
+        return self._cached_function_middleware_pipeline
 
     @overload
     def get_response(
@@ -2043,11 +2054,11 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
         *,
         stream: Literal[False] = ...,
         options: ChatOptions[ResponseModelBoundT],
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         compaction_strategy: CompactionStrategy | None = None,
         tokenizer: TokenizerProtocol | None = None,
         function_invocation_kwargs: Mapping[str, Any] | None = None,
         client_kwargs: Mapping[str, Any] | None = None,
-        **kwargs: Any,
     ) -> Awaitable[ChatResponse[ResponseModelBoundT]]: ...
 
     @overload
@@ -2057,11 +2068,11 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
         *,
         stream: Literal[False] = ...,
         options: OptionsCoT | ChatOptions[None] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         compaction_strategy: CompactionStrategy | None = None,
         tokenizer: TokenizerProtocol | None = None,
         function_invocation_kwargs: Mapping[str, Any] | None = None,
         client_kwargs: Mapping[str, Any] | None = None,
-        **kwargs: Any,
     ) -> Awaitable[ChatResponse[Any]]: ...
 
     @overload
@@ -2071,11 +2082,11 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
         *,
         stream: Literal[True],
         options: OptionsCoT | ChatOptions[Any] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         compaction_strategy: CompactionStrategy | None = None,
         tokenizer: TokenizerProtocol | None = None,
         function_invocation_kwargs: Mapping[str, Any] | None = None,
         client_kwargs: Mapping[str, Any] | None = None,
-        **kwargs: Any,
     ) -> ResponseStream[ChatResponseUpdate, ChatResponse[Any]]: ...
 
     def get_response(
@@ -2084,14 +2095,13 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
         *,
         stream: bool = False,
         options: OptionsCoT | ChatOptions[Any] | None = None,
-        function_middleware: Sequence[FunctionMiddlewareTypes] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         compaction_strategy: CompactionStrategy | None = None,
         tokenizer: TokenizerProtocol | None = None,
         function_invocation_kwargs: Mapping[str, Any] | None = None,
         client_kwargs: Mapping[str, Any] | None = None,
-        **kwargs: Any,
     ) -> Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]:
-        from ._middleware import FunctionMiddlewarePipeline
+        from ._middleware import categorize_middleware
         from ._types import (
             ChatResponse,
             ChatResponseUpdate,
@@ -2100,25 +2110,22 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
         )
 
         super_get_response = super().get_response  # type: ignore[misc]
-        if kwargs:
-            warnings.warn(
-                "Passing client-specific keyword arguments directly to get_response() is deprecated; "
-                "pass them via client_kwargs instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         effective_client_kwargs = dict(client_kwargs) if client_kwargs is not None else {}
-        effective_function_middleware = function_middleware
-        if effective_function_middleware is None:
-            middleware_from_client_kwargs = effective_client_kwargs.pop("function_middleware", None)
-            if middleware_from_client_kwargs is not None:
-                effective_function_middleware = cast(Sequence[Any], middleware_from_client_kwargs)
+        if middleware is not None:
+            existing = effective_client_kwargs.get("middleware", [])
+            effective_client_kwargs["middleware"] = [
+                *(
+                    existing
+                    if isinstance(existing, Sequence) and not isinstance(existing, (str, bytes))
+                    else [existing]
+                ),
+                *middleware,
+            ]
+        runtime_middleware = categorize_middleware(effective_client_kwargs.pop("middleware", []))
 
-        # ChatMiddleware adds this kwarg
-        function_middleware_pipeline = FunctionMiddlewarePipeline(
-            *(self.function_middleware), *(effective_function_middleware or [])
-        )
+        function_middleware_pipeline = self._get_function_middleware_pipeline(runtime_middleware["function"])
+        if runtime_middleware["chat"]:
+            effective_client_kwargs["middleware"] = runtime_middleware["chat"]
         max_errors = self.function_invocation_configuration.get(
             "max_consecutive_errors_per_request", DEFAULT_MAX_CONSECUTIVE_ERRORS_PER_REQUEST
         )
@@ -2138,19 +2145,23 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
             invocation_session=invocation_session,
             middleware_pipeline=function_middleware_pipeline,
         )
-        filtered_kwargs = {k: v for k, v in {**effective_client_kwargs, **kwargs}.items() if k != "session"}
+        filtered_kwargs = {k: v for k, v in effective_client_kwargs.items() if k != "session"}
 
         # Make options mutable so we can update conversation_id during function invocation loop
         mutable_options: dict[str, Any] = dict(options) if options else {}
         # Remove additional_function_arguments from options passed to underlying chat client
         # It's for tool invocation only and not recognized by chat service APIs
         mutable_options.pop("additional_function_arguments", None)
-        # Support tools passed via kwargs in direct client.get_response(...) calls.
-        if "tools" in filtered_kwargs:
-            if mutable_options.get("tools") is None:
-                mutable_options["tools"] = filtered_kwargs["tools"]
-            filtered_kwargs.pop("tools", None)
-
+        if not self.function_invocation_configuration.get("enabled", True):
+            return super_get_response(  # type: ignore[no-any-return]
+                messages=messages,
+                stream=stream,
+                options=mutable_options,
+                compaction_strategy=compaction_strategy,
+                tokenizer=tokenizer,
+                function_invocation_kwargs=function_invocation_kwargs,
+                client_kwargs=filtered_kwargs,
+            )
         if not stream:
 
             async def _get_response() -> ChatResponse[Any]:
@@ -2197,7 +2208,7 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
                     aggregated_usage = add_usage_details(aggregated_usage, response.usage_details)
 
                     if response.conversation_id is not None:
-                        _update_conversation_id(kwargs, response.conversation_id, mutable_options)
+                        _update_conversation_id(filtered_kwargs, response.conversation_id, mutable_options)
                         prepped_messages = []
 
                     result = await _process_function_requests(
@@ -2341,7 +2352,7 @@ class FunctionInvocationLayer(Generic[OptionsCoT]):
                     return
 
                 if response.conversation_id is not None:
-                    _update_conversation_id(kwargs, response.conversation_id, mutable_options)
+                    _update_conversation_id(filtered_kwargs, response.conversation_id, mutable_options)
                     prepped_messages = []
 
                 result = await _process_function_requests(

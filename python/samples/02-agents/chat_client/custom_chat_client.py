@@ -7,6 +7,7 @@ from collections.abc import AsyncIterable, Awaitable, Mapping, Sequence
 from typing import Any, ClassVar, TypeAlias, TypedDict
 
 from agent_framework import (
+    Agent,
     BaseChatClient,
     ChatMiddlewareLayer,
     ChatResponse,
@@ -29,7 +30,10 @@ else:
 Custom Chat Client Implementation Example
 
 This sample demonstrates implementing a custom chat client and optionally composing
-middleware, telemetry, and function invocation layers explicitly.
+middleware, telemetry, and function invocation layers explicitly. The recommended
+layer order is `FunctionInvocationLayer -> ChatMiddlewareLayer -> ChatTelemetryLayer`
+so chat middleware runs within each tool-loop iteration while telemetry records
+per-call spans without middleware latency.
 """
 
 
@@ -124,9 +128,9 @@ class EchoingChatClient(BaseChatClient[OptionsT]):
 
 
 class EchoingChatClientWithLayers(  # type: ignore[misc]
+    FunctionInvocationLayer[OptionsT],
     ChatMiddlewareLayer[OptionsT],
     ChatTelemetryLayer[OptionsT],
-    FunctionInvocationLayer[OptionsT],
     EchoingChatClient,
 ):
     """Echoing chat client that explicitly composes middleware, telemetry, and function layers."""
@@ -156,7 +160,8 @@ async def main() -> None:
     print(f"Direct response: {direct_response.messages[0].text}")
 
     # Create an agent using the custom chat client
-    echo_agent = echo_client.as_agent(
+    echo_agent = Agent(
+        client=echo_client,
         name="EchoAgent",
         instructions="You are a helpful assistant that echoes back what users say.",
     )
