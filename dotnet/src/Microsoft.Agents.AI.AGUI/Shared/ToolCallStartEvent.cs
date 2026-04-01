@@ -22,6 +22,5 @@ internal sealed class ToolCallStartEvent : BaseEvent
     public string ToolCallName { get; set; } = string.Empty;
 
     [JsonPropertyName("parentMessageId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ParentMessageId { get; set; }
 }
